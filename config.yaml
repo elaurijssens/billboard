@@ -1,0 +1,20 @@
+active_start: "08:00"
+active_end: "23:00"
+
+targets:
+  - "192.168.12.213"
+  - "192.168.12.203"
+  - "192.168.12.189"
+  - "192.168.14.49"
+  - "192.168.15.43"
+  - "192.168.15.45"
+
+sources:
+  - path: "http://192.168.12.10:8123/local/weather_image_resized.png"
+    display_time: 10
+#  - path: "/home/pi/images/local_forecast.png"
+#    display_time: 15
+#  - path: "/home/pi/images/webcam_snapshot.png"
+#    display_time: 8
+
+remote_configuration_url: "http://yourserver.local/remote_config.json"
