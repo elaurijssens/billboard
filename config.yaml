@@ -1,5 +1,5 @@
-active_start: "08:00"
-active_end: "23:00"
+width: 256
+height: 384
 
 targets:
   - "192.168.12.213"
@@ -8,6 +8,12 @@ targets:
   - "192.168.14.49"
   - "192.168.15.43"
   - "192.168.15.45"
+
+active_start: "08:00"
+active_end: "23:00"
+
+random: true
+no_repeat_window: 3
 
 sources:
   - path: "http://192.168.12.10:8123/local/weather_image_resized.png"
@@ -18,3 +24,8 @@ sources:
 #    display_time: 8
 
 remote_configuration_url: "http://yourserver.local/remote_config.json"
+
+crop: true
+crop_origin:
+  horizontal: center  # or left / right
+  vertical: middle    # or top / bottom

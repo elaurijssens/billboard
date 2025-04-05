@@ -9,6 +9,8 @@ from datetime import datetime, time as dtime
 from urllib.parse import urlparse
 import yaml
 import os
+import random
+from collections import deque
 
 # --- Load configuration from YAML file and optional remote override ---
 def load_configuration(config_path):
@@ -20,15 +22,12 @@ def load_configuration(config_path):
         try:
             response = requests.get(remote_url, timeout=5)
             response.raise_for_status()
-            remote_config = response.json()
+            remote_config = yaml.safe_load(response.text)
             print("🔗 Remote configuration loaded.")
 
-            if 'active_start' in remote_config and 'active_end' in remote_config:
-                config['active_start'] = remote_config['active_start']
-                config['active_end'] = remote_config['active_end']
-
-            if 'sources' in remote_config:
-                config['sources'] = remote_config['sources']
+            for key in ['active_start', 'active_end', 'sources', 'random', 'no_repeat_window', 'width', 'height', 'crop', 'crop_origin']:
+                if key in remote_config:
+                    config[key] = remote_config[key]
 
         except Exception as e:
             print(f"⚠️ Failed to load remote config: {e}")
@@ -42,12 +41,46 @@ def is_nighttime(start_str, end_str):
     end = dtime.fromisoformat(end_str)
     return not (start <= now < end) if start < end else not (now >= start or now < end)
 
-# --- Utility: Create a single black 256x64 image ---
-def create_black_part():
-    return Image.new("RGB", (256, 64), color=(0, 0, 0))
+# --- Utility: Create a single black image with configured dimensions ---
+def create_black_part(width, height):
+    return Image.new("RGB", (width, height), color=(0, 0, 0))
 
-# --- Load, optionally resize, and split an image from URL or file path ---
-def split_image(source):
+# --- Crop image to desired aspect ratio based on crop origin ---
+def crop_to_aspect(img, target_width, target_height, crop_origin):
+    target_ratio = target_width / target_height
+    img_width, img_height = img.size
+    img_ratio = img_width / img_height
+
+    if img_ratio > target_ratio:
+        new_width = int(target_ratio * img_height)
+        new_height = img_height
+    else:
+        new_width = img_width
+        new_height = int(img_width / target_ratio)
+
+    horiz, vert = crop_origin.get('horizontal', 'center'), crop_origin.get('vertical', 'middle')
+
+    if horiz == 'left':
+        left = 0
+    elif horiz == 'right':
+        left = img_width - new_width
+    else:
+        left = (img_width - new_width) // 2
+
+    if vert == 'top':
+        top = 0
+    elif vert == 'bottom':
+        top = img_height - new_height
+    else:
+        top = (img_height - new_height) // 2
+
+    box = (left, top, left + new_width, top + new_height)
+    return img.crop(box)
+
+# --- Load, optionally crop/resize, and split an image from URL or file path ---
+def split_image(source, width, height, crop=False, crop_origin=None):
+    crop_origin = crop_origin or {'horizontal': 'center', 'vertical': 'middle'}
+
     try:
         if urlparse(source).scheme in ("http", "https"):
             response = requests.get(source)
@@ -60,15 +93,19 @@ def split_image(source):
     except Exception as e:
         raise RuntimeError(f"Failed to load image from '{source}': {e}")
 
-    width, height = img.size
-    if width != 256 or height != 384:
-        print(f"🔧 Resizing image from {width}x{height} to 256x384")
-        img = img.resize((256, 384), Image.LANCZOS)
+    if crop:
+        print("🌍 Cropping to aspect ratio")
+        img = crop_to_aspect(img, width, height, crop_origin)
 
+    img_width, img_height = img.size
+    if img_width != width or img_height != height:
+        print(f"🔧 Resizing image from {img_width}x{img_height} to {width}x{height}")
+        img = img.resize((width, height), Image.LANCZOS)
+
+    slice_height = height // 6
     parts = []
-    slice_height = 64
     for i in range(6):
-        box = (0, i * slice_height, 256, (i + 1) * slice_height)
+        box = (0, i * slice_height, width, (i + 1) * slice_height)
         parts.append(img.crop(box))
 
     return parts
@@ -117,6 +154,13 @@ def main():
     targets = config.get("targets", [])
     active_start = config.get("active_start", "08:00")
     active_end = config.get("active_end", "23:00")
+    use_random = config.get("random", False)
+    no_repeat_window = config.get("no_repeat_window", 0)
+    default_width = config.get("width", 256)
+    default_height = config.get("height", 384)
+    default_crop = config.get("crop", False)
+    default_crop_origin = config.get("crop_origin", {'horizontal': 'center', 'vertical': 'middle'})
+    recent_queue = deque(maxlen=no_repeat_window)
 
     print("🔁 Starting continuous loop through image sources. Press Ctrl+C to exit.\n")
 
@@ -124,7 +168,7 @@ def main():
         while True:
             if is_nighttime(active_start, active_end):
                 print("🌙 Night hours — displaying black screens.")
-                black = create_black_part()
+                black = create_black_part(default_width, default_height // 6)
                 parts = [black] * 6
 
                 with ThreadPoolExecutor(max_workers=6) as executor:
@@ -144,17 +188,47 @@ def main():
                 time.sleep(60)
                 continue
 
-            for index, source_entry in enumerate(sources):
+            if use_random:
+                defined_shares = [s.get('shares', None) for s in sources if isinstance(s, dict)]
+                if any(s is not None for s in defined_shares):
+                    total_defined = sum(s for s in defined_shares if s is not None)
+                    num_sources = len(sources)
+                    for s in sources:
+                        if isinstance(s, dict) and 'shares' not in s:
+                            s['shares'] = max(total_defined // num_sources, 1)
+                else:
+                    for s in sources:
+                        if isinstance(s, dict):
+                            s.setdefault('shares', 1)
+
+                available_sources = [s for i, s in enumerate(sources) if i not in recent_queue]
+                if not available_sources:
+                    recent_queue.clear()
+                    available_sources = sources[:]
+
+                weights = [s.get('shares', 1) if isinstance(s, dict) else 1 for s in available_sources]
+                selected = random.choices(available_sources, weights=weights, k=1)[0]
+                selected_index = sources.index(selected)
+                recent_queue.append(selected_index)
+                entries = [selected]
+            else:
+                entries = sources
+
+            for index, source_entry in enumerate(entries):
                 if isinstance(source_entry, dict):
                     source = source_entry.get("path")
                     display_time = source_entry.get("display_time", 10)
+                    crop = source_entry.get("crop", default_crop)
+                    crop_origin = source_entry.get("crop_origin", default_crop_origin)
                 else:
                     source = source_entry
                     display_time = 10
+                    crop = default_crop
+                    crop_origin = default_crop_origin
 
-                print(f"\n📆 Processing source {index+1}/{len(sources)}: {source}")
+                print(f"\n📆 Processing source {index+1}/{len(entries)}: {source}")
                 try:
-                    image_parts = split_image(source)
+                    image_parts = split_image(source, default_width, default_height, crop=crop, crop_origin=crop_origin)
                 except Exception as e:
                     print(f"❌ Skipping {source}: {e}")
                     continue
